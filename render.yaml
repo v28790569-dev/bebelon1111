@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: escape-auth-server
+    env: python
+    buildCommand: ""
+    startCommand: "python server.py"
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: IS_ESCAPE_SERVER
+        value: "1"

@@ -1,0 +1,2 @@
+# Zero external dependencies needed!
+# server.py uses only Python standard library (http.server, json, hashlib, hmac, urllib)
