@@ -109,7 +109,8 @@ def call_cloud_api(endpoint: str, payload: dict = None, timeout: float = 3.5) ->
     except urllib.error.HTTPError as e:
         try:
             raw = e.read().decode("utf-8", errors="ignore")
-            return True, json.loads(raw)
+            data = json.loads(raw)
+            return False, data
         except Exception:
             return False, {"error": f"HTTP {e.code}: {e.reason}"}
     except Exception as e:
@@ -363,10 +364,16 @@ class DatabaseManager:
 
     # ---------------- USER OPERATIONS ----------------
 
-    def register_user(self, email: str, login: str, password: str) -> tuple[bool, str]:
+    def register_user(self, email: str, login: str, password: str, hwid: str = None) -> tuple[bool, str]:
         # If client mode with cloud host configured, perform remote registration
         if not os.environ.get("IS_ESCAPE_SERVER") and get_cloud_server_url():
-            ok, res = call_cloud_api("/api/register", {"email": email, "login": login, "password": password})
+            client_hwid = hwid or get_hwid()
+            ok, res = call_cloud_api("/api/register", {
+                "email": email,
+                "login": login,
+                "password": password,
+                "hwid": client_hwid
+            })
             if ok:
                 if res.get("success"):
                     self._load()
@@ -379,7 +386,7 @@ class DatabaseManager:
                         "email": email.strip().lower(),
                         "password_hash": h,
                         "salt": salt,
-                        "hwid": get_hwid(),
+                        "hwid": client_hwid,
                         "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "subscription_until": sub_end,
                         "is_admin": is_admin_user,
@@ -413,7 +420,12 @@ class DatabaseManager:
             if not ok:
                 return False, msg
 
-        current_hwid = get_hwid()
+        # Server should not use its own host HWID; use client's passed hwid, or None so it binds on first login!
+        if os.environ.get("IS_ESCAPE_SERVER"):
+            user_hwid = hwid or None
+        else:
+            user_hwid = hwid or get_hwid()
+
         h, salt = hash_password(password)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -426,7 +438,7 @@ class DatabaseManager:
             "email": email,
             "password_hash": h,
             "salt": salt,
-            "hwid": current_hwid,
+            "hwid": user_hwid,
             "registered_at": now_str,
             "subscription_until": sub_end,
             "is_admin": is_admin_user,
@@ -485,16 +497,17 @@ class DatabaseManager:
         if not verify_password(password, user_data["salt"], user_data["password_hash"]):
             return False, "Неверный пароль!", {}
 
-        if user_key.lower() in ("bebelon", "cracked"):
-            user_data["is_admin"] = True
-            user_data["subscription_until"] = "2099-12-31 23:59:59"
-            self._save()
-
-        # HWID CHECK
         current_hwid = get_hwid()
         bound_hwid = user_data.get("hwid")
 
-        if not bound_hwid:
+        # Admin accounts are never locked out of their own client
+        if user_key.lower() == "bebelon" or user_data.get("is_admin", False):
+            if user_key.lower() == "bebelon":
+                user_data["is_admin"] = True
+            user_data["subscription_until"] = "2099-12-31 23:59:59"
+            user_data["hwid"] = current_hwid
+            self._save()
+        elif not bound_hwid:
             # First login: bind HWID
             user_data["hwid"] = current_hwid
             self._save()
@@ -794,7 +807,107 @@ class DatabaseManager:
         self.data["users"][matched]["is_banned"] = False
         self.data["users"][matched]["ban_reason"] = ""
         self._save()
-        return True, f"Пользователь '{matched}' разблокирован"
+    def check_user_status(self, login: str) -> dict:
+        """Returns live ban and subscription status for heartbeat monitoring."""
+        if not os.environ.get("IS_ESCAPE_SERVER") and get_cloud_server_url():
+            ok, res = call_cloud_api("/api/check_status", {"login": login}, timeout=2.5)
+            if ok and res.get("success"):
+                return res
+
+        self._load()
+        user = None
+        for k, v in self.data["users"].items():
+            if k.lower() == login.strip().lower():
+                user = v
+                break
+
+        if not user:
+            return {"success": False, "is_banned": True, "ban_reason": "Аккаунт не найден", "sub_active": False}
+
+        sub_info = self.get_subscription_info(user["login"])
+        is_owner = (user["login"].lower() == "bebelon")
+        is_adm = user.get("is_admin", False) or is_owner
+        is_banned = bool(user.get("is_banned", False)) and not is_owner
+
+        return {
+            "success": True,
+            "is_banned": is_banned,
+            "ban_reason": user.get("ban_reason", "Нарушение правил"),
+            "sub_active": sub_info.get("active", False) or is_adm,
+            "sub_display": sub_info.get("display", "Истекла"),
+            "is_admin": is_adm,
+            "is_owner": is_owner
+        }
+
+    def revoke_subscription(self, target_login: str, caller_login: str = "bebelon") -> tuple[bool, str]:
+        """Revokes all subscription days from user, immediately expiring access."""
+        if caller_login.lower() != "bebelon":
+            return False, "Только bebelon может снимать подписки!"
+
+        if not os.environ.get("IS_ESCAPE_SERVER") and get_cloud_server_url():
+            ok, res = call_cloud_api("/api/admin/revoke_sub", {"caller_login": caller_login, "target_login": target_login})
+            if ok and res.get("success"):
+                return True, res.get("message", "Подписка успешно аннулирована!")
+            else:
+                err_text = res.get("message") or res.get("error") or ""
+                if "Unknown admin endpoint" in str(err_text) or "404" in str(err_text):
+                    return False, "Сначала загрузите обновлённый server.py на GitHub (Render ещё не обновился)!"
+                return False, err_text or "Ошибка выполнения на сервере"
+
+        self._load()
+        matched = None
+        for k in self.data["users"].keys():
+            if k.lower() == target_login.strip().lower():
+                matched = k
+                break
+
+        if not matched:
+            return False, f"Пользователь '{target_login}' не найден"
+        if matched.lower() == "bebelon":
+            return False, "Нельзя снять подписку у владельца (bebelon)!"
+
+        self.data["users"][matched]["subscription_until"] = "2000-01-01 00:00:00"
+        self.data["users"][matched]["is_lifetime"] = False
+        self._save()
+        return True, f"Подписка у пользователя '{matched}' успешно аннулирована!"
+
+    def set_admin(self, target_login: str, is_admin: bool, caller_login: str = "bebelon") -> tuple[bool, str]:
+        """Grants or revokes admin privileges. Only bebelon has permission."""
+        if caller_login.lower() != "bebelon":
+            return False, "Только bebelon может изменять права администратора!"
+
+        if not os.environ.get("IS_ESCAPE_SERVER") and get_cloud_server_url():
+            ok, res = call_cloud_api("/api/admin/set_admin", {
+                "caller_login": caller_login,
+                "target_login": target_login,
+                "is_admin": is_admin
+            })
+            if ok and res.get("success"):
+                return True, res.get("message", "Статус успешно обновлен!")
+            else:
+                err_text = res.get("message") or res.get("error") or ""
+                if "Unknown admin endpoint" in str(err_text) or "404" in str(err_text):
+                    return False, "Сначала загрузите обновлённый server.py на GitHub (Render ещё не обновился)!"
+                return False, err_text or "Ошибка выполнения на сервере"
+
+        self._load()
+        matched = None
+        for k in self.data["users"].keys():
+            if k.lower() == target_login.strip().lower():
+                matched = k
+                break
+
+        if not matched:
+            return False, f"Пользователь '{target_login}' не найден"
+        if matched.lower() == "bebelon":
+            return False, "Нельзя изменить статус главного владельца (bebelon)!"
+
+        self.data["users"][matched]["is_admin"] = is_admin
+        if is_admin:
+            self.data["users"][matched]["subscription_until"] = "2099-12-31 23:59:59"
+        self._save()
+        status_text = "назначен администратором" if is_admin else "снят с должности администратора"
+        return True, f"Пользователь '{matched}' {status_text}!"
 
 
 # Singleton database instance
